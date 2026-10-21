@@ -1,0 +1,117 @@
+# A Loja Prateleira inteira: loja, PSP e o api-gateway na frente.
+# Supõe os três repositórios lado a lado:
+#   ../e-commerce-RF   ../payment-ledger-service   ./ (api-gateway)
+#
+#   docker compose up --build        →  http://localhost:8080
+#
+# Só o gateway publica porta. Os segredos abaixo são de desenvolvimento
+# (trilhos simulados, ADR 0001 do PSP); troque todos fora daqui.
+
+x-dev-secrets:
+  platform-token: &platform-token ${PLATFORM_ADMIN_TOKEN:-dev-platform-token-troque-em-producao}
+
+services:
+  psp-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ledger
+      POSTGRES_PASSWORD: ledger
+      POSTGRES_DB: ledger
+    volumes:
+      - psp-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ledger -d ledger"]
+      interval: 2s
+      retries: 30
+
+  ecommerce-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: docker
+      POSTGRES_PASSWORD: docker
+      POSTGRES_DB: ecommerce
+    volumes:
+      - ecommerce-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U docker -d ecommerce"]
+      interval: 2s
+      retries: 30
+
+  psp:
+    build: ../payment-ledger-service
+    environment:
+      PORT: "3001"
+      DATABASE_URL: postgresql://ledger:ledger@psp-db:5432/ledger
+      PLATFORM_ADMIN_TOKEN: *platform-token
+      # AES-256 do cofre de cartões (ADR 0005): 32 bytes em base64
+      VAULT_ENCRYPTION_KEY: ${VAULT_ENCRYPTION_KEY:-ZGV2LW9ubHktdmF1bHQta2V5LTMyLWJ5dGVzLWxvbmc=}
+      SIMULATORS_ENABLED: "true"
+      SETTLEMENT_INTERVAL_MS: "10000"
+    depends_on:
+      psp-db:
+        condition: service_healthy
+
+  # Liga a loja ao PSP uma vez: cadastra o lojista, registra o webhook e grava
+  # as chaves no volume compartilhado, que a loja lê ao subir.
+  setup:
+    image: node:22-bookworm-slim
+    command: ["node", "/setup/setup.mjs"]
+    environment:
+      PSP_URL: http://psp:3001
+      WEBHOOK_URL: http://ecommerce:3000/webhooks/payments
+      PLATFORM_ADMIN_TOKEN: *platform-token
+      PSP_SETUP_ENV_FILE: /shared/psp.env
+    volumes:
+      - ../e-commerce-RF/scripts/psp:/setup:ro
+      - psp-keys:/shared
+    depends_on:
+      - psp
+
+  ecommerce:
+    build:
+      context: ../e-commerce-RF
+      dockerfile: .docker/app/Dockerfile
+    environment:
+      PORT: "3000"
+      DB_HOST: ecommerce-db
+      DB_PORT: "5432"
+      DB_USER: docker
+      DB_PASSWORD: docker
+      DB_NAME: ecommerce
+      SECRET_KEY_JWT: ${SECRET_KEY_JWT:-dev-jwt-troque-em-producao}
+      PSP_URL: http://psp:3001
+      # o navegador chega ao PSP por /psp, na mesma origem (api-gateway)
+      PSP_PUBLIC_URL: /psp
+      PSP_ENV_FILE: /shared/psp.env
+    volumes:
+      - psp-keys:/shared:ro
+    depends_on:
+      ecommerce-db:
+        condition: service_healthy
+      setup:
+        condition: service_completed_successfully
+
+  web:
+    build:
+      context: ../e-commerce-RF/web
+      args:
+        VITE_TEST_MODE: "true"
+
+  gateway:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      ECOMMERCE_URL: http://ecommerce:3000
+      PSP_URL: http://psp:3001
+      WEB_URL: http://web
+      SIMULATORS_ENABLED: "true"
+    depends_on:
+      - ecommerce
+      - psp
+      - web
+
+volumes:
+  psp-data:
+  ecommerce-data:
+  psp-keys:
